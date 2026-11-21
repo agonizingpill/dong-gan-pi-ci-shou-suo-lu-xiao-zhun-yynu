@@ -1,0 +1,88 @@
+name: freeze-dry-shrinkage
+x-python: &python
+  image: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-python:local
+  build: ./backend
+  environment:
+    DB_HOST: db
+    MYSQL_DATABASE: ${MYSQL_DATABASE:-freeze_lab}
+    MYSQL_USER: ${MYSQL_USER:-lab}
+    MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-lab-password}
+    REDIS_URL: redis://redis:6379/0
+    JWT_SECRET: ${JWT_SECRET:-demo-freeze-laboratory-evidence-signing-key}
+    SEED_DEMO: ${SEED_DEMO:-true}
+    OPENBLAS_NUM_THREADS: '1'
+    OMP_NUM_THREADS: '1'
+  volumes:
+    - evidence:/evidence
+  depends_on:
+    db: {condition: service_healthy}
+    redis: {condition: service_healthy}
+services:
+  frontend:
+    build: ./frontend
+    container_name: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-frontend
+    ports:
+      - '${FRONTEND_PORT:-18261}:80'
+    depends_on:
+      backend: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, '-q', '-O', /dev/null, 'http://127.0.0.1/api/health']
+      interval: 3s
+      timeout: 3s
+      retries: 15
+  backend:
+    <<: *python
+    container_name: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-backend
+    command: [sh, ./start.sh]
+    ports:
+      - '${BACKEND_PORT:-19261}:8000'
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 25
+  worker:
+    <<: *python
+    container_name: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-worker
+    command: [python, -m, src.worker]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      backend: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "from pathlib import Path; import time; assert time.time()-Path('/tmp/worker-heartbeat').stat().st_mtime < 25"]
+      interval: 3s
+      timeout: 3s
+      retries: 25
+  db:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-db
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-freeze_lab}
+      MYSQL_USER: ${MYSQL_USER:-lab}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-lab-password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-root-password}
+    ports:
+      - '${DB_PORT:-17761}:3306'
+    volumes:
+      - lab-db:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'mysql --protocol=TCP -h 127.0.0.1 -u"$$MYSQL_USER" -p"$$MYSQL_PASSWORD" "$$MYSQL_DATABASE" -Nse "SELECT 1" >/dev/null 2>&1']
+      interval: 3s
+      timeout: 4s
+      retries: 35
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-freeze-dry-shrinkage}-redis
+    command: [redis-server, '--appendonly', 'yes']
+    volumes:
+      - lab-redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+volumes:
+  lab-db:
+  lab-redis:
+  evidence:
