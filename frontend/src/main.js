@@ -53,6 +53,15 @@ async function draw() {
       const detail = selected ? await api.batch(selected) : null;
       if (index !== renderIndex) return;
       store.batch = detail;
+      if (current === 'lab' && detail) {
+        try {
+          store.modelReviews = await api.modelReviews(detail.recipe.code);
+        } catch (error) {
+          store.modelReviews = null;
+        }
+      } else if (current !== 'lab') {
+        store.modelReviews = null;
+      }
     }
     const pages = {batches: batchesPage, lab: labPage, release: releasePage};
     show(shell(current, store.user, pages[current]()));
@@ -136,12 +145,29 @@ const commands = {
     await draw();
     toast('批次放行已签发');
   },
+  requestModelReview: async data => {
+    await api.createModelReview(store.modelReviews.recipe.code, data);
+    await draw();
+    toast('模型评审已生成，可查看双策略判窗与启用依据');
+  },
+  activateModel: async (data, _button, form) => {
+    const reviewId = form.dataset.review;
+    await api.activateModel(reviewId, data);
+    await draw();
+    toast('候选模型已按配方启用并升版');
+  },
+  rejectModel: async (data, _button, form) => {
+    const reviewId = form.dataset.review;
+    await api.rejectModel(reviewId, data);
+    await draw();
+    toast('模型评审已驳回，沿用现行模型');
+  },
 };
 
-async function execute(action, payload, button) {
+async function execute(action, payload, button, form) {
   if (button) button.disabled = true;
   try {
-    await commands[action](payload);
+    await commands[action](payload, button, form);
   } catch (error) {
     if (error.status === 401 && action !== 'login') logout();
     toast(error.message, true);
@@ -153,7 +179,7 @@ async function execute(action, payload, button) {
 root.addEventListener('submit', event => {
   event.preventDefault();
   const form = event.target;
-  execute(form.dataset.action, Object.fromEntries(new FormData(form)), event.submitter);
+  execute(form.dataset.action, Object.fromEntries(new FormData(form)), event.submitter, form);
 });
 root.addEventListener('click', event => {
   const button = event.target.closest('button');

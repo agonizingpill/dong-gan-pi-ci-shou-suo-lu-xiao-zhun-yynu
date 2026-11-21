@@ -35,18 +35,23 @@ def seed(db):
             db.add(RecipeLot(code=code, product=product, solids_pct=solids, nominal_mm=nominal,
                              window_low=low, window_high=high))
     db.flush()
+    # 同一份冻结原料（APL-1101、APL-1104）分别分给两台冻干机：
+    # 逐批留一会让同原料批的另一条曲线漏进训练集（FD-1101 因此被误放），
+    # 原料批整组留出能堵住该泄漏；原料批仅三组，是整组留出可评审的最低配置。
     fixtures = [
-        ('FD-1101', 7.1, 170, 23, -27, 10, BatchState.REFERENCE),
-        ('FD-1104', 8.0, 240, 31, -20, 14, BatchState.REFERENCE),
-        ('FD-1108', 9.1, 340, 45, -12, 20, BatchState.REFERENCE),
-        ('FD-1121A', 8.0, 243, 32, -20, 13, BatchState.COLLECTING),
-        ('FD-1121B', 8.2, 252, 32, -19, None, BatchState.COLLECTING),
-        ('FD-1121C', 9.3, 365, 49, -9, 19, BatchState.COLLECTING),
+        ('FD-1101', 'APL-1101', 'FDX-02', 7.0, 150, 21, -29, 16.3, BatchState.REFERENCE),
+        ('FD-1102', 'APL-1101', 'FDX-05', 7.7, 210, 28, -23, 13.5, BatchState.REFERENCE),
+        ('FD-1104', 'APL-1104', 'FDX-02', 7.9, 230, 29, -21, 14.0, BatchState.REFERENCE),
+        ('FD-1105', 'APL-1104', 'FDX-05', 8.6, 285, 37, -16, 14.5, BatchState.REFERENCE),
+        ('FD-1108', 'APL-1108', 'FDX-02', 9.2, 350, 47, -11, 18.0, BatchState.REFERENCE),
+        ('FD-1121A', 'APL-1121A', 'FDX-02', 8.0, 243, 32, -20, 13, BatchState.COLLECTING),
+        ('FD-1121B', 'APL-1121B', 'FDX-05', 8.2, 252, 32, -19, None, BatchState.COLLECTING),
+        ('FD-1121C', 'APL-1121C', 'FDX-02', 9.3, 365, 49, -9, 19, BatchState.COLLECTING),
     ]
-    for code, feed, minutes, pressure, temp, shrinkage, state in fixtures:
+    for code, material_lot, dryer, feed, minutes, pressure, temp, shrinkage, state in fixtures:
         if db.get(DryBatch, code) is not None:
             continue
-        batch = DryBatch(code=code, recipe_code='AP-26R3', dryer='FDX-02', material_lot=f'APL-{code[3:]}',
+        batch = DryBatch(code=code, recipe_code='AP-26R3', dryer=dryer, material_lot=material_lot,
                          feed_mm=feed, state=state)
         db.add(batch)
         db.flush()

@@ -47,6 +47,18 @@ class ReleaseState(StrEnum):
     RELEASED = 'released'
 
 
+class FitStrategy(StrEnum):
+    BATCH_LOO = 'batch_loo'            # 现行：逐批留一、批次等权
+    LOT_GROUPOUT = 'lot_groupout'      # 候选：原料批整组留出、原料批等权
+
+
+class ReviewState(StrEnum):
+    DRAFT = 'draft'
+    REJECTED = 'rejected'
+    ACTIVE = 'active'
+    SUPERSEDED = 'superseded'
+
+
 def enum(values):
     return Enum(values, values_callable=lambda variants: [item.value for item in variants])
 
@@ -67,6 +79,8 @@ class RecipeLot(Base):
     nominal_mm: Mapped[float] = mapped_column(Double)
     window_low: Mapped[float] = mapped_column(Double)
     window_high: Mapped[float] = mapped_column(Double)
+    model_strategy: Mapped[FitStrategy] = mapped_column(enum(FitStrategy), default=FitStrategy.BATCH_LOO)
+    model_version: Mapped[int] = mapped_column(default=1)
 
 
 class DryBatch(Base):
@@ -124,6 +138,27 @@ class CalibrationRelease(Base):
     signed_at = mapped_column(DateTime(), nullable=True)
     touched_at = mapped_column(DateTime(), default=utcnow)
     attempts: Mapped[int] = mapped_column(default=0)
+
+
+class ModelReview(Base):
+    __tablename__ = 'model_reviews'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recipe_code: Mapped[str] = mapped_column(ForeignKey('recipe_lots.code'), index=True)
+    state: Mapped[ReviewState] = mapped_column(enum(ReviewState), default=ReviewState.DRAFT, index=True)
+    basis_version: Mapped[int]
+    strategy: Mapped[FitStrategy] = mapped_column(enum(FitStrategy))
+    reference_hash: Mapped[str] = mapped_column(String(64))
+    n_references: Mapped[int]
+    n_material_lots: Mapped[int]
+    evaluation: Mapped[dict] = mapped_column(JSON)
+    eligible: Mapped[bool] = mapped_column(Boolean, default=False)
+    basis_note: Mapped[str | None] = mapped_column(String(240))
+    requested_by: Mapped[str] = mapped_column(String(32))
+    decided_by: Mapped[str | None] = mapped_column(String(32))
+    decided_at = mapped_column(DateTime(), nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(String(240))
+    created_at = mapped_column(DateTime(), default=utcnow)
+    touched_at = mapped_column(DateTime(), default=utcnow)
 
 
 class LabEvent(Base):

@@ -7,10 +7,11 @@ from fastapi import HTTPException
 from redis.exceptions import RedisError
 from sqlalchemy import inspect, select
 
+from .calculation import evaluate_strategies
 from .db import QUEUE, redis, utcnow
 from .models import (
-    BatchState, CalibrationRelease, ChamberRun, DryBatch, LabEvent, Phase, RecipeLot,
-    ReleaseState, RunState, ShrinkageSample, Stage,
+    BatchState, CalibrationRelease, ChamberRun, DryBatch, FitStrategy, LabEvent, ModelReview, Phase,
+    RecipeLot, ReleaseState, ReviewState, RunState, ShrinkageSample, Stage,
 )
 
 log = logging.getLogger(__name__)
@@ -188,7 +189,8 @@ def queue_fit(db, batch, actor):
         archived = latest_run(db, historical.code)
         pairs = paired_measurements(db, archived)
         training.append({
-            'batch': historical.code, 'curve_hash': archived.checksum,
+            'batch': historical.code, 'material_lot': historical.material_lot,
+            'curve_hash': archived.checksum,
             'features': feature_row(historical, recipe, archived), 'observed': observed(pairs), 'pairs': pairs,
         })
     feature_columns = zip(*(item['features'] for item in training), strict=True)
@@ -198,6 +200,7 @@ def queue_fit(db, batch, actor):
         'batch': batch.code, 'recipe': recipe.code, 'curve_hash': run.checksum,
         'features': feature_row(batch, recipe, run), 'sample_pairs': target_pairs,
         'window': [round(recipe.window_low, 5), round(recipe.window_high, 5)], 'training': training,
+        'fit_strategy': recipe.model_strategy.value, 'model_version': recipe.model_version,
     }
     release = CalibrationRelease(run_id=run.id, requested_by=actor, input_hash=checksum(snapshot), snapshot=snapshot)
     db.add(release)
@@ -256,3 +259,109 @@ def sign_release(db, batch, run, release, actor, note):
     release.touched_at = release.signed_at
     batch.state = BatchState.RELEASED
     record(db, actor, 'release.sign', f'{run.source_name} · {note}', batch.code)
+
+
+def reference_training(db, recipe):
+    reference = db.scalars(select(DryBatch).filter_by(recipe_code=recipe.code, state=BatchState.REFERENCE)
+                           .order_by(DryBatch.code)).all()
+    training = []
+    for historical in reference:
+        archived = latest_run(db, historical.code)
+        pairs = paired_measurements(db, archived)
+        training.append({
+            'batch': historical.code, 'material_lot': historical.material_lot,
+            'curve_hash': archived.checksum,
+            'features': feature_row(historical, recipe, archived), 'observed': observed(pairs),
+        })
+    return training
+
+
+def reference_fingerprint(training):
+    basis = [
+        {'batch': item['batch'], 'material_lot': item['material_lot'], 'curve_hash': item['curve_hash'],
+         'features': item['features'], 'observed': item['observed']}
+        for item in training
+    ]
+    return checksum(basis)
+
+
+def create_model_review(db, recipe, actor, note):
+    locked = db.scalar(select(RecipeLot).where(RecipeLot.code == recipe.code).with_for_update())
+    try:
+        training = reference_training(db, locked)
+    except ValueError as exc:
+        blocked(db, actor, 'model.review', str(exc), locked.code)
+    if len(training) < 3:
+        blocked(db, actor, 'model.review', '至少需要三个同配方的已认证标定参考批次', locked.code)
+    material_lots = {item['material_lot'] for item in training}
+    snapshot = {
+        'recipe': locked.code,
+        'window': [round(locked.window_low, 5), round(locked.window_high, 5)],
+        'training': training,
+    }
+    evaluation = evaluate_strategies(snapshot)
+    review = ModelReview(
+        recipe_code=locked.code, state=ReviewState.DRAFT, basis_version=locked.model_version,
+        strategy=FitStrategy.LOT_GROUPOUT, reference_hash=reference_fingerprint(training),
+        n_references=len(training), n_material_lots=len(material_lots),
+        evaluation=evaluation, eligible=evaluation[FitStrategy.LOT_GROUPOUT.value]['eligible'],
+        basis_note=evaluation[FitStrategy.LOT_GROUPOUT.value]['enablement_basis'],
+        requested_by=actor,
+    )
+    db.add(review)
+    db.flush()
+    record(db, actor, 'model.review.request',
+           f'{locked.code} · 参考 {len(training)} 批 / 原料批 {len(material_lots)} 组 · {note}', locked.code)
+    return review
+
+
+def _review_lock(db, review_id):
+    review = db.get(ModelReview, review_id, with_for_update=True)
+    if review is None:
+        raise HTTPException(404, '没有找到该模型评审')
+    recipe = db.scalar(select(RecipeLot).where(RecipeLot.code == review.recipe_code).with_for_update())
+    return review, recipe
+
+
+def activate_model_review(db, review_id, actor, note):
+    review, recipe = _review_lock(db, review_id)
+    if review.state != ReviewState.DRAFT:
+        blocked(db, actor, 'model.review.activate', '仅待决策的评审可以启用', recipe.code)
+    if not review.eligible:
+        blocked(db, actor, 'model.review.activate', review.basis_note or '候选模型未满足启用条件', recipe.code)
+    if recipe.model_version != review.basis_version:
+        blocked(db, actor, 'model.review.activate',
+                f'在用模型已变更为第 {recipe.model_version} 版，请基于在用版本重新发起评审', recipe.code)
+    try:
+        training = reference_training(db, recipe)
+    except ValueError as exc:
+        blocked(db, actor, 'model.review.activate', str(exc), recipe.code)
+    if reference_fingerprint(training) != review.reference_hash:
+        blocked(db, actor, 'model.review.activate', '认证参考批次已变化，请基于当前在用版本重新发起评审', recipe.code)
+    for stale in db.scalars(select(ModelReview).filter_by(recipe_code=recipe.code, state=ReviewState.DRAFT)):
+        if stale.id != review.id:
+            stale.state = ReviewState.SUPERSEDED
+            stale.touched_at = utcnow()
+    recipe.model_strategy = review.strategy
+    recipe.model_version += 1
+    review.state = ReviewState.ACTIVE
+    review.decided_by = actor
+    review.decided_at = utcnow()
+    review.decision_note = note
+    review.touched_at = review.decided_at
+    record(db, actor, 'model.review.activate',
+           f'{recipe.code} 启用第 {recipe.model_version} 版 · 原料批整组留出/原料批等权 · {note}', recipe.code)
+    return review
+
+
+def reject_model_review(db, review_id, actor, note):
+    review, recipe = _review_lock(db, review_id)
+    if review.state != ReviewState.DRAFT:
+        blocked(db, actor, 'model.review.reject', '仅待决策的评审可以驳回', recipe.code)
+    review.state = ReviewState.REJECTED
+    review.decided_by = actor
+    review.decided_at = utcnow()
+    review.decision_note = note
+    review.touched_at = review.decided_at
+    record(db, actor, 'model.review.reject', f'{recipe.code} · {note}', recipe.code)
+    return review

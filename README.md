@@ -9,7 +9,7 @@
 | 角色 | 主要页面 | 权限和典型动作 |
 |---|---|---|
 | `operator` 实验员 | 批次与曲线、收缩率试算、放行详情 | 登记冻干批次，导入并冻结曲线，配对厚度，提交试算，登记独立试片复测 |
-| `supervisor` 签发主管 | 批次与曲线、收缩率试算、放行详情 | 建新配方版本，认证历史标定参考，提交试算或重试，签发已复测确认的批次 |
+| `supervisor` 签发主管 | 批次与曲线、收缩率试算、放行详情 | 建新配方版本，认证历史标定参考，提交试算或重试，发起/启用/驳回模型评审，签发已复测确认的批次 |
 | `viewer` 只读观察员 | 全部业务页 | 查阅批次、配方、曲线、测量、拟合证据和签发台账 |
 
 三个账号的用户名就是角色，演示密码均为 `Lab-demo-1062`。
@@ -26,7 +26,7 @@
 6. 09:00 `FD-1121B_chamber_r0.csv` 缺少抽真空段，冻结与试算均被拒绝。补传 `FD-1121B_chamber_recovered.csv` 后，仍须补齐 `TRAY-Q2` 冻干后 7.07 mm 才能提交。
 7. 09:30 `FD-1121C_chamber_r1.csv` 的预测超过 16.0%。实验员复测后仍留置本周期。若要重新评估，导入新曲线并记录该曲线的新试片，历史留置单继续可查。
 
-首次启动 seed 含 6 批、3 配方、2 条缺真空的曲线、20 条测量和 2 个试算输入。worker 会把两个试算分别推进窗内待复测和超窗待复测。历史曲线、试片和校准单都有确定的关联，重复 seed 保留已有状态与业务录入。
+首次启动 seed 含 8 批（其中 5 个认证参考批，覆盖 3 个原料批；`APL-1101`、`APL-1104` 两个原料批各分给 `FDX-02`、`FDX-05` 两台冻干机）、3 配方、2 条缺真空的曲线、20 条以上测量和 2 个试算输入。worker 会把两个试算分别推进窗内待复测和超窗待复测。历史曲线、试片和校准单都有确定的关联，重复 seed 保留已有状态与业务录入。
 
 ## 启动
 
@@ -64,15 +64,17 @@ docker compose down -v --remove-orphans
 
 - 曲线按分钟递增，阶段依次为预冻、抽真空、解析干燥，抽真空阶段至少两个点。冻结生成摘要，试算绑定冻结版本。更换曲线会开启新周期；历史首测继续归属于历史周期。
 - 历史批须由主管认证，同配方至少三批，且同一曲线下至少两个试片成对。参考批的标签取各试片 `100 × (1 − 冻干后厚度 / 冻干前厚度)` 的均值。当前待评估批的测量用于阶段门禁与台账追溯。
-- 五个候选特征为配方固形物、投料与标称厚度之比、首尾真空点的分钟差、真空段压力和板温的采集点算术平均。同配方下恒定列自动排除。对有变化的列应用 Yeo–Johnson 并标准化，拟合 `Ridge(alpha=0.65, solver='svd')`。逐批留一时在每折重新拟合变换，验证误差以百分点计。固定复现标识 1062，SVD 求解过程没有随机采样。实测误差和预测保留六位小数，变换参数与回归系数保留十位小数。快照和模型结果保存在数据库与 `/evidence/fit-<id>.json`。
+- 五个候选特征为配方固形物、投料与标称厚度之比、首尾真空点的分钟差、真空段压力和板温的采集点算术平均。同配方下恒定列自动排除。对有变化的列应用 Yeo–Johnson 并标准化，拟合 `Ridge(alpha=0.65, solver='svd')`。逐折交叉验证时在每折重新拟合变换，验证误差以百分点计。固定复现标识 1062，SVD 求解过程没有随机采样。实测误差和预测保留六位小数，变换参数与回归系数保留十位小数。快照和模型结果保存在数据库与 `/evidence/fit-<id>.json`。
+- 同一原料批可能分给多台冻干机，逐批留一会让同原料批的另一条曲线漏进训练集。每个配方维护两套可复算的策略：现行 `batch_loo`（逐批留一、批次等权）与候选 `lot_groupout`（按原料批整组留出、原料批等权，同料多机在拟合中各占 `1/批数` 的权重，避免单一原料批主导回归）。试算快照冻结 `fit_strategy` 与 `model_version`，已排队试算即使失败重试也不换模型；新提交的试算才采用配方当前在用版本。
+- 候选模型按配方启用。主管在收缩率试算页发起评审，系统对同一份冻结参考快照同时跑两套交叉验证，并按工艺窗对每一折给出四种判窗：窗内判窗内、超窗判超窗、误放（实测超窗却预报窗内）、误留（实测窗内却预报超窗）。仅当候选误放组数严格少于现行、且误留组数不增加时才可启用；原料批不足三组直接判定不满足，沿用现行模型。评审保存参考指纹与基准版本，启用时若在用版本或认证参考批次已变化（并发起用/参考被重新认证）返回 HTTP 409，须基于在用版本重新发起。启用后配方策略切换并把 `model_version` 加一，旧草稿评审自动作废。
 - 窗内预测仍需独立试片复测。预测超窗或复测超窗都会将这次校准留置。复测达窗且预测达窗时主管可签发。物理证据不足返回 HTTP 409 并记操作者、拒绝原因和时间。
 - Redis 唤醒队列以已提交的 MySQL 校准记录为准，短暂滞留会由 worker 扫描回收。错误单可用原快照重试。数据库批次行锁串行化曲线、测量、复测和签发写入。
 
-`backend/src/models.py` 与 `backend/migrations/initial.py` 定义初始数据库。`schemas.py` 是入参协议，`ledger.py` 是领域状态和工况提取，`routes.py` 暴露读写接口。`calculation.py` 与 `worker.py` 分离计算和队列提交。`frontend/src/api.js` 管理 API 和会话状态，`pages/` 实现四个页面，`components/` 保存共用状态标示、工艺窗和曲线。
+`backend/src/models.py` 与 `backend/migrations/initial.py` 定义初始数据库（迁移可重复执行，会为旧库补齐模型策略列与模型评审表）。`schemas.py` 是入参协议，`ledger.py` 是领域状态、工况提取和模型评审，`routes.py` 暴露读写接口。`calculation.py` 与 `worker.py` 分离计算和队列提交。`frontend/src/api.js` 管理 API 和会话状态，`pages/` 实现四个页面，`components/model-review.js` 渲染双策略判窗与启用依据，`components/` 保存共用状态标示、工艺窗和曲线。
 
 前端改动可通过 `docker compose up -d --build frontend` 重建。后端本地开发可装 `backend/requirements.txt`，设置 `DB_HOST`、`DB_PORT`、`REDIS_URL` 和数据库凭据，再从 `backend/` 运行 `python -m migrations.initial`、`python -m scripts.seed_demo`、`uvicorn src.app:app --reload`。直接运行 worker 时需提供可写的 `/evidence`，完整联调可用 Compose。
 
-共享枚举的后端定义均在 `backend/src/models.py`。`Role` 出现在 `auth.py`、`routes.py`、seed 与前端 `presentation.js`、`components/ledger.js`、`pages/` 的动作分支。`Stage` 出现在 `schemas.py`、`ledger.py`、seed 和前端 `presentation.js`、`pages/batches.js`、`pages/calibration.js`。`Phase` 出现在 `schemas.py`、`ledger.py`、seed 和前端 `presentation.js`、`components/curve.js`、`pages/batches.js`。`BatchState`、`RunState`、`ReleaseState` 由后端 `ledger.py`、`worker.py`、seed 写入，前端 `presentation.js`、`components/ledger.js` 和各业务页读取。
+共享枚举的后端定义均在 `backend/src/models.py`。`Role` 出现在 `auth.py`、`routes.py`、seed 与前端 `presentation.js`、`components/ledger.js`、`pages/` 的动作分支。`Stage` 出现在 `schemas.py`、`ledger.py`、seed 和前端 `presentation.js`、`pages/batches.js`、`pages/calibration.js`。`Phase` 出现在 `schemas.py`、`ledger.py`、seed 和前端 `presentation.js`、`components/curve.js`、`pages/batches.js`。`BatchState`、`RunState`、`ReleaseState` 由后端 `ledger.py`、`worker.py`、seed 写入，前端 `presentation.js`、`components/ledger.js` 和各业务页读取。`FitStrategy`（`batch_loo` / `lot_groupout`）保存在配方行并随试算快照冻结，`ReviewState`（草稿、已驳回、已启用、已作废）驱动模型评审的状态守卫；二者在前端经 `presentation.js` 的 `strategies`、`states` 与 `verdict-tag` 展示。
 
 授权方式沿用所属工作区的许可约定。
 

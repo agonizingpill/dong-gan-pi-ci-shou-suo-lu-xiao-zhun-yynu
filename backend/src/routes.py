@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from . import ledger
 from .auth import identity, issue, require, valid_password
 from .db import session
-from .models import CalibrationRelease, ChamberRun, DryBatch, LabEvent, RecipeLot, Role, User
+from .models import CalibrationRelease, ChamberRun, DryBatch, LabEvent, ModelReview, RecipeLot, Role, User
 from .schemas import BatchIn, CurveIn, DecisionIn, Login, RecipeIn, RetestIn, SampleIn
 
 router = APIRouter()
@@ -194,3 +194,47 @@ def sign(entry_id: int, payload: DecisionIn, db: Session = Depends(session), use
     ledger.sign_release(db, batch, run, entry, user.username, payload.note)
     db.commit()
     return ledger.row(entry)
+
+
+@router.get('/recipes/{code}/model-reviews', dependencies=[Depends(identity)])
+def model_reviews(code: str, db: Session = Depends(session)):
+    recipe = db.get(RecipeLot, code)
+    if recipe is None:
+        raise HTTPException(404, '请选用已建档的配方版本')
+    rows = db.scalars(select(ModelReview).filter_by(recipe_code=code).order_by(ModelReview.id.desc())).all()
+    return {
+        'recipe': ledger.row(recipe),
+        'reviews': [ledger.row(review) for review in rows],
+    }
+
+
+@router.get('/model-reviews/{review_id}', dependencies=[Depends(identity)])
+def model_review_detail(review_id: int, db: Session = Depends(session)):
+    review = db.get(ModelReview, review_id)
+    if review is None:
+        raise HTTPException(404, '没有找到该模型评审')
+    return {'review': ledger.row(review), 'recipe': ledger.row(db.get(RecipeLot, review.recipe_code))}
+
+
+@router.post('/recipes/{code}/model-reviews', status_code=201)
+def request_model_review(code: str, payload: DecisionIn, db: Session = Depends(session), user=Depends(supervisor)):
+    recipe = db.get(RecipeLot, code)
+    if recipe is None:
+        raise HTTPException(404, '请选用已建档的配方版本')
+    review = ledger.create_model_review(db, recipe, user.username, payload.note)
+    commit(db, '模型评审保存冲突，请重试')
+    return ledger.row(review)
+
+
+@router.post('/model-reviews/{review_id}/activate')
+def activate_model(review_id: int, payload: DecisionIn, db: Session = Depends(session), user=Depends(supervisor)):
+    review = ledger.activate_model_review(db, review_id, user.username, payload.note)
+    db.commit()
+    return ledger.row(review)
+
+
+@router.post('/model-reviews/{review_id}/reject')
+def reject_model(review_id: int, payload: DecisionIn, db: Session = Depends(session), user=Depends(supervisor)):
+    review = ledger.reject_model_review(db, review_id, user.username, payload.note)
+    db.commit()
+    return ledger.row(review)

@@ -1,6 +1,7 @@
 import {store} from '../api.js';
 import {badge, measurementBand, pageTitle, sectionTitle, windowLabel} from '../components/ledger.js';
-import {events, h, number, stages, when} from '../presentation.js';
+import {modelReviewPanel} from '../components/model-review.js';
+import {events, h, number, stages, strategyShort, verdicts, when} from '../presentation.js';
 
 export function labPage() {
   const detail = store.batch;
@@ -22,8 +23,10 @@ export function labPage() {
       <section class="sheet fitting"><div>${sectionTitle('参考与拟合')}
       <div class="padded"><strong class="algorithm">Yeo–Johnson<br><span>+ Ridge</span></strong>
       <ol class="method"><li>取同配方通过主管认证的参考批次。</li><li>从冻结曲线提取真空段时长、均压、均温，并结合配方及投料厚度。</li>
-      <li>对有变化的特征变换及标准化，拟合 Ridge；逐批留一计算 RMSE。</li></ol></div></div>
-      ${entry?.result ? `<div class="fit-summary"><span>预测收缩率</span><strong class="mono">${number(entry.prediction_pct)}%</strong>${badge(entry.state)}</div>` : ''}</section></div>`;
+      <li>按在用策略（${h(strategyShort[detail.recipe.model_strategy] || detail.recipe.model_strategy)} · v${number(detail.recipe.model_version, 0)}）对有变化的特征变换及标准化，拟合 Ridge；交叉验证计算 RMSE 与各组判窗。</li></ol></div></div>
+      ${entry?.result ? `<div class="fit-summary"><span>预测收缩率</span><strong class="mono">${number(entry.prediction_pct)}%</strong>${badge(entry.state)}</div>` : ''}</section>
+    </div>
+    ${modelReviewPanel(store)}`;
 }
 
 function registerTable() {
@@ -31,6 +34,18 @@ function registerTable() {
   return `<table><thead><tr><th>冻干批次</th><th>校准状态</th><th>预测收缩率</th><th>冻结曲线</th></tr></thead><tbody>
     ${store.register.map(entry => `<tr><th><a class="mono" href="#release/${entry.id}">${h(entry.batch_code)} / ${String(entry.id).padStart(3, '0')}</a></th>
     <td>${badge(entry.state)}</td><td class="mono">${entry.prediction_pct == null ? '—' : `${number(entry.prediction_pct)}%`}</td><td class="mono">${h(entry.source_name)}</td></tr>`).join('')}</tbody></table>`;
+}
+
+function cvGroupTable(groups) {
+  const grouped = groups.some(group => group.held_out_batches?.length > 1);
+  return `<details class="entry-form evidence-details" open><summary>各组判窗（${groups.length} 组交叉验证）</summary>
+    <div class="table-scroll"><table class="group-table"><thead><tr>
+    <th>${grouped ? '原料批 / 留出冻干批' : '留出冻干批'}</th><th>实测 %</th><th>预测 %</th><th>判窗</th></tr></thead><tbody>
+    ${groups.map(group => `<tr><th><span class="mono">${h(group.label)}</span>${
+      group.held_out_batches?.length > 1 ? `<br><small class="mono">${h(group.held_out_batches.join('、'))}</small>` : ''
+    }</th><td class="mono">${number(group.observed_pct)}</td><td class="mono">${number(group.prediction_pct)}</td>
+    <td><span class="verdict-tag" data-verdict="${h(group.verdict)}">${h(verdicts[group.verdict] || group.verdict)}</span></td></tr>`).join('')}
+  </tbody></table></div></details>`;
 }
 
 function workflow(data) {
@@ -77,9 +92,15 @@ export function releasePage() {
       ${measurementBand(entry.snapshot.window, entry.prediction_pct, entry.recheck_pct)}
       <div class="fit-metrics"><span><i class="dot prediction"></i>预测</span><span><i class="dot recheck"></i>复测</span><span><i class="dot window"></i>工艺窗</span></div></div></section>
       <section class="sheet evidence">${sectionTitle('拟合证据', `${entry.snapshot.training.length} 个参考批次`)}<div class="padded">
-      <dl class="evidence-grid"><div><dt>模型</dt><dd>Yeo–Johnson / Ridge</dd></div><div><dt>逐批留一 RMSE</dt><dd class="mono">${number(entry.result?.loo_rmse, 3)} pp</dd></div>
-      <div><dt>Ridge α / 求解器</dt><dd class="mono">${number(entry.result?.alpha, 2)} / ${h(entry.result?.solver || '—')}</dd></div><div><dt>复现种子</dt><dd class="mono">${h(entry.result?.seed || '—')}</dd></div></dl>
-      <details class="entry-form evidence-details"><summary>参考批次与快照指纹</summary><ul>${entry.snapshot.training.map(reference => `<li><span class="mono">${h(reference.batch)}</span> <span>${number(reference.observed)}%</span></li>`).join('')}</ul>
+      <dl class="evidence-grid"><div><dt>模型</dt><dd>Yeo–Johnson / Ridge</dd></div>
+      <div><dt>交叉验证 / 权重</dt><dd>${h(entry.result?.cv_scheme || '逐批留一')} · ${h(entry.result?.weighting || '批次等权')}</dd></div>
+      <div><dt>交叉验证 RMSE</dt><dd class="mono">${number(entry.result?.cv_rmse ?? entry.result?.loo_rmse, 3)} pp</dd></div>
+      <div><dt>原料批组数</dt><dd class="mono">${number(entry.result?.n_material_lots, 0)} 组 / ${number(entry.result?.n_references, 0)} 批</dd></div>
+      <div><dt>在用模型版本</dt><dd class="mono">v${number(entry.snapshot.model_version ?? 1, 0)} · ${h(strategyShort[entry.snapshot.fit_strategy] || entry.snapshot.fit_strategy || 'batch_loo')}</dd></div>
+      <div><dt>Ridge α / 求解器</dt><dd class="mono">${number(entry.result?.alpha, 2)} / ${h(entry.result?.solver || '—')}</dd></div>
+      <div><dt>复现种子</dt><dd class="mono">${h(entry.result?.seed || '—')}</dd></div></dl>
+      ${entry.result?.cv_groups?.length ? cvGroupTable(entry.result.cv_groups) : ''}
+      <details class="entry-form evidence-details"><summary>参考批次与快照指纹</summary><ul>${entry.snapshot.training.map(reference => `<li><span class="mono">${h(reference.batch)}</span> <small class="mono">${h(reference.material_lot || '')}</small> <span>${number(reference.observed)}%</span></li>`).join('')}</ul>
       <p class="hash mono">${h(entry.input_hash)}</p></details></div></section>
     </div><div>${workflow(data)}<section class="sheet history">${sectionTitle('批次审计记录')}
       <ol>${data.events.map(event => `<li><b>${h(events[event.action] || (event.action.endsWith('.blocked') ? '操作拒绝' : event.action))}</b><time>${when(event.happened_at)}</time>
